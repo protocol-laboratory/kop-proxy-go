@@ -28,6 +28,15 @@ func ReadEarliestMsg(partitionedTopic string, maxWaitMs int, pulsarClient pulsar
 	return readNextMsg(readerOptions, maxWaitMs, pulsarClient)
 }
 
+func GetLatestMsgId(partitionedTopic string, client *padmin.PulsarAdmin) (*padmin.MessageId, error) {
+	tenant, namespace, topic, err := getTenantNamespaceTopicFromPartitionedTopic(partitionedTopic)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Println(tenant, namespace, topic)
+	return client.PersistentTopics.GetLastMessageId(tenant, namespace, topic)
+}
+
 func ReadLatestMsg(partitionedTopic string, maxWaitMs int, messageId *padmin.MessageId, pulsarClient pulsar.Client) (pulsar.Message, error) {
 	var msgId pulsar.MessageID
 	bytes, err := generateMsgBytes(messageId)
@@ -49,14 +58,6 @@ func ReadLatestMsg(partitionedTopic string, maxWaitMs int, messageId *padmin.Mes
 	return readNextMsg(readerOptions, maxWaitMs, pulsarClient)
 }
 
-func GetLatestMsgId(partitionedTopic string, client *padmin.PulsarAdmin) (*padmin.MessageId, error) {
-	tenant, namespace, topic, err := getTenantNamespaceTopicFromPartitionedTopic(partitionedTopic)
-	if err != nil {
-		return nil, err
-	}
-	return client.PersistentTopics.GetLastMessageId(tenant, namespace, topic)
-}
-
 func getTenantNamespaceTopicFromPartitionedTopic(partitionedTopic string) (tenant, namespace, shortPartitionedTopic string, err error) {
 	if strings.Contains(partitionedTopic, "//") {
 		topicArr := strings.Split(partitionedTopic, "//")
@@ -75,7 +76,7 @@ func getTenantNamespaceTopicFromPartitionedTopic(partitionedTopic string) (tenan
 func readNextMsg(operation pulsar.ReaderOptions, maxWaitMs int, pulsarClient pulsar.Client) (pulsar.Message, error) {
 	reader, err := pulsarClient.CreateReader(operation)
 	if err != nil {
-		logrus.Warnf("create pulsar lasted read failed. topic: %s, err: %s", operation.Topic, err)
+		logrus.Warnf("create pulsar latest read failed. topic: %s, err: %s", operation.Topic, err)
 		return nil, err
 	}
 	defer reader.Close()
@@ -83,10 +84,10 @@ func readNextMsg(operation pulsar.ReaderOptions, maxWaitMs int, pulsarClient pul
 	defer cancel()
 	message, err := reader.Next(ctx)
 	if err != nil {
-		logrus.Errorf("get message failed. topic: %s, err: %s", operation.Topic, err)
 		if strings.Contains(err.Error(), constant.ReadMsgTimeoutErr) {
 			return message, nil
 		}
+		logrus.Errorf("get message failed. topic: %s, err: %s", operation.Topic, err)
 		return nil, err
 	}
 	return message, nil

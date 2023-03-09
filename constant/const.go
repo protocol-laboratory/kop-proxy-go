@@ -25,7 +25,7 @@ const (
 	ReadMsgTimeoutErr = "context deadline exceeded"
 )
 
-const (
+var (
 	AllPermissionType      = "ALL"
 	ProducerPermissionType = "W"
 	ConsumerPermissionType = "R"
