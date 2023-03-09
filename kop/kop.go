@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"github.com/apache/pulsar-client-go/pulsar"
 	"github.com/pkg/errors"
+	"github.com/protocol-laboratory/kafka-codec-go/codec"
 	"github.com/protocol-laboratory/kafka-codec-go/knet"
 	"github.com/protocol-laboratory/pulsar-admin-go/padmin"
 	"github.com/sirupsen/logrus"
+	"net"
 	"sync"
 )
 
@@ -28,6 +30,8 @@ type Config struct {
 	MinFetchWaitMs           int
 	MaxFetchWaitMs           int
 	ContinuousOffset         bool
+	MaxProducerRecordSize    int
+	MaxBatchSize             int
 	// PulsarTenant use for kafsar internal
 	PulsarTenant string
 	// PulsarNamespace use for kafsar internal
@@ -69,6 +73,51 @@ type Server interface {
 	ListTopic(username string) ([]string, error)
 
 	HasFlowQuota(username, topic string) bool
+}
+
+type KafkaAction interface {
+	PartitionNumAction(addr net.Addr, topic string) (int, error)
+
+	TopicListAction(addr net.Addr) ([]string, error)
+
+	// FetchAction method called this already authed
+	FetchAction(addr net.Addr, req *codec.FetchReq) ([]*codec.FetchTopicResp, error)
+
+	// GroupJoinAction method called this already authed
+	GroupJoinAction(addr net.Addr, req *codec.JoinGroupReq) (*codec.JoinGroupResp, error)
+
+	// GroupLeaveAction method called this already authed
+	GroupLeaveAction(addr net.Addr, req *codec.LeaveGroupReq) (*codec.LeaveGroupResp, error)
+
+	// GroupSyncAction method called this already authed
+	GroupSyncAction(addr net.Addr, req *codec.SyncGroupReq) (*codec.SyncGroupResp, error)
+
+	// OffsetListPartitionAction method called this already authed
+	OffsetListPartitionAction(addr net.Addr, topic, clientID string, req *codec.ListOffsetsPartition) (*codec.ListOffsetsPartitionResp, error)
+
+	// OffsetCommitPartitionAction method called this already authed
+	OffsetCommitPartitionAction(addr net.Addr, topic, clientID string, req *codec.OffsetCommitPartitionReq) (*codec.OffsetCommitPartitionResp, error)
+
+	// OffsetFetchAction method called this already authed
+	OffsetFetchAction(addr net.Addr, topic, clientID, groupID string, req *codec.OffsetFetchPartitionReq) (*codec.OffsetFetchPartitionResp, error)
+
+	// OffsetLeaderEpochAction method called this already authed
+	OffsetLeaderEpochAction(addr net.Addr, topic string, req *codec.OffsetLeaderEpochPartitionReq) (*codec.OffsetForLeaderEpochPartitionResp, error)
+
+	// ProduceAction method called this already authed
+	ProduceAction(addr net.Addr, topic string, partition int, req *codec.ProducePartitionReq) (*codec.ProducePartitionResp, error)
+
+	SaslAuthAction(addr net.Addr, req codec.SaslAuthenticateReq) (bool, codec.ErrorCode)
+
+	SaslAuthTopicAction(addr net.Addr, req codec.SaslAuthenticateReq, topic, permissionType string) (bool, codec.ErrorCode)
+
+	AuthGroupTopicAction(topic, groupId string) bool
+
+	SaslAuthConsumerGroupAction(addr net.Addr, req codec.SaslAuthenticateReq, consumerGroup string) (bool, codec.ErrorCode)
+
+	HeartBeatAction(addr net.Addr, req codec.HeartbeatReq) *codec.HeartbeatResp
+
+	DisconnectAction(addr net.Addr)
 }
 
 type Broker struct {
@@ -142,6 +191,7 @@ func NewKop(impl Server, config *Config) (*Broker, error) {
 }
 
 func (b *Broker) Run() error {
+	logrus.Infof("broker started!")
 	b.knetServer.Run()
 	return nil
 }
@@ -151,4 +201,59 @@ func (b *Broker) Close() {
 		logrus.Errorf("stop broker failed: %v", err)
 	}
 	b.pClient.Close()
+}
+
+func (b *Broker) getCtx(conn net.Conn) *NetworkContext {
+	b.connMutex.Lock()
+	defer b.connMutex.Unlock()
+	return getContext(conn)
+}
+
+func (b *Broker) Authed(ctx *NetworkContext) bool {
+	if !b.config.NeedSasl {
+		return true
+	}
+	return ctx.authed
+}
+
+func (b *Broker) checkSasl(ctx *NetworkContext) bool {
+	if !b.config.NeedSasl {
+		return true
+	}
+	_, ok := b.SaslMap.Load(ctx.Addr)
+	return ok
+}
+
+func (b *Broker) authGroupTopic(topic, groupId string) bool {
+	return b.AuthGroupTopicAction(topic, groupId)
+}
+
+func (b *Broker) checkSaslGroup(ctx *NetworkContext, groupId string) bool {
+	if !b.config.NeedSasl {
+		return true
+	}
+	saslReq, ok := b.SaslMap.Load(ctx.Addr)
+	if !ok {
+		return false
+	}
+	res, code := b.SaslAuthConsumerGroupAction(ctx.Addr, saslReq.(codec.SaslAuthenticateReq), groupId)
+	if code != 0 || !res {
+		return false
+	}
+	return true
+}
+
+func (b *Broker) checkSaslTopic(ctx *NetworkContext, topic, permissionType string) bool {
+	if !b.config.NeedSasl {
+		return true
+	}
+	saslReq, ok := b.SaslMap.Load(ctx.Addr)
+	if !ok {
+		return false
+	}
+	res, code := b.SaslAuthTopicAction(ctx.Addr, saslReq.(codec.SaslAuthenticateReq), topic, permissionType)
+	if code != 0 || !res {
+		return false
+	}
+	return true
 }
