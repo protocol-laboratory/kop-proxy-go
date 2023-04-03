@@ -1,10 +1,15 @@
 package kop
 
 import (
+	"github.com/go-redis/redis/v8"
 	"github.com/protocol-laboratory/kafka-codec-go/codec"
+	"sync"
 )
 
 type GroupCoordinatorCluster struct {
+	mutex        sync.RWMutex
+	groupManager map[string]*Group
+	redisdb      redis.Cmdable
 }
 
 func NewGroupCoordinatorCluster() *GroupCoordinatorCluster {
