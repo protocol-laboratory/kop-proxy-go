@@ -69,7 +69,6 @@ func (g *GroupCoordinatorStandalone) HandleJoinGroup(username, groupId, memberId
 			groupId, memberId, numMember, g.config.MaxConsumersPerGroup)
 		return &codec.JoinGroupResp{
 			MemberId: memberId,
-			//ErrorCode: codec.GROUP_MAX_SIZE_REACHED,
 			ErrorCode: codec.UNKNOWN_SERVER_ERROR,
 		}, nil
 	}
