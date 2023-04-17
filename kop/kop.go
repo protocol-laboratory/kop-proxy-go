@@ -50,6 +50,9 @@ type Config struct {
 	InitialDelayedJoinMs int
 	// RebalanceTickMs
 	RebalanceTickMs int
+
+	// TopicLevelMetricsDisable if true, disable topic level metrics
+	TopicLevelMetricsDisable bool
 }
 
 type PulsarConfig struct {
@@ -188,10 +191,10 @@ func NewKop(impl Server, config *Config) (*Broker, error) {
 			break
 		}
 	}
-	if config.GroupCoordinatorType == Cluster {
-		broker.groupCoordinator = NewGroupCoordinatorCluster(config.RedisConfig)
-	} else if config.GroupCoordinatorType == Standalone {
-		broker.groupCoordinator = NewGroupCoordinatorStandalone(config, broker.pClient)
+	if config.GroupCoordinatorType == GroupCoordinatorTypeMemory {
+		broker.groupCoordinator = NewGroupCoordinatorMemory(config, broker.pClient)
+	} else if config.GroupCoordinatorType == GroupCoordinatorTypeRedis {
+		broker.groupCoordinator = NewGroupCoordinatorRedis(config.RedisConfig)
 	} else {
 		return nil, errors.Errorf("unexpect GroupCoordinatorType: %v", config.GroupCoordinatorType)
 	}
