@@ -56,6 +56,9 @@ type Config struct {
 
 	// TopicLevelMetricsDisable if true, disable topic level metrics
 	TopicLevelMetricsDisable bool
+
+	DebugPulsarTopicSet map[string]bool
+	DebugKafkaTopicSet  map[string]bool
 }
 
 type PulsarConfig struct {
