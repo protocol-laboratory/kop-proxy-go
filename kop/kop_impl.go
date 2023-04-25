@@ -550,7 +550,7 @@ OUT:
 		}
 		if utils.DebugTopicMatch(b.config.DebugKafkaTopicSet, b.config.DebugPulsarTopicSet, kafkaTopic, partitionedTopic) {
 			logrus.Infof("message add to batch. kafka topic %s pulsar topic: %s, partition: %d, offset: %d, messageId: %s",
-				kafkaTopic, partitionedTopic, req.PartitionId, message.Index(), message.ID())
+				kafkaTopic, partitionedTopic, req.PartitionId, offset, message.ID())
 		}
 		recordBatch.Records = append(recordBatch.Records, &record)
 		consumerMetadata.mutex.Lock()
