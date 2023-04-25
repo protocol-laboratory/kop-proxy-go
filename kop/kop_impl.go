@@ -511,10 +511,6 @@ OUT:
 		}
 		consumerMetadata.mutex.Lock()
 		message, err := consumerMetadata.consumer.Receive(ctx)
-		if utils.DebugTopicMatch(b.config.DebugPulsarTopicSet, b.config.DebugKafkaTopicSet, kafkaTopic, partitionedTopic) {
-			logrus.Infof("message received. kafka topic %s from pulsar topic: %s, partition: %d, offset: %d, messageId: %s\n",
-				kafkaTopic, partitionedTopic, req.PartitionId, message.Index(), message.ID())
-		}
 		if err != nil {
 			consumerMetadata.mutex.Unlock()
 			if ctx.Err() != nil {
@@ -522,6 +518,10 @@ OUT:
 			}
 			logrus.Errorf("partitionedTopic %s read msg failed: %s", partitionedTopic, err)
 			continue
+		}
+		if utils.DebugTopicMatch(b.config.DebugKafkaTopicSet, b.config.DebugPulsarTopicSet, kafkaTopic, partitionedTopic) {
+			logrus.Infof("message received. kafka topic %s from pulsar topic: %s, partition: %d, offset: %d, messageId: %s\n",
+				kafkaTopic, partitionedTopic, req.PartitionId, message.Index(), message.ID())
 		}
 		err = consumerMetadata.consumer.Ack(message)
 		if err != nil {
@@ -548,7 +548,7 @@ OUT:
 				RelativeOffset: int(relativeOffset),
 			}
 		}
-		if utils.DebugTopicMatch(b.config.DebugPulsarTopicSet, b.config.DebugKafkaTopicSet, kafkaTopic, partitionedTopic) {
+		if utils.DebugTopicMatch(b.config.DebugKafkaTopicSet, b.config.DebugPulsarTopicSet, kafkaTopic, partitionedTopic) {
 			logrus.Infof("message add to batch. kafka topic %s pulsar topic: %s, partition: %d, offset: %d, messageId: %s\n",
 				kafkaTopic, partitionedTopic, req.PartitionId, message.Index(), message.ID())
 		}

@@ -1,13 +1,15 @@
 package utils
 
-func DebugTopicMatch(kMap, pMap map[string]bool, kTopic, pTopic string) bool {
-	return kMap[kTopic] && pMap[pTopic]
+import "github.com/Shoothzj/gox/set"
+
+func DebugTopicMatch(kSet, pSet set.Set[string], kTopic, pTopic string) bool {
+	return DebugKafkaTopicMatch(kSet, kTopic) || DebugPulsarPartitionTopicMatch(pSet, pTopic)
 }
 
-func DebugKafkaTopicMatch(m map[string]bool, topic string) bool {
-	return m[topic]
+func DebugKafkaTopicMatch(s set.Set[string], topic string) bool {
+	return s.Contains(topic)
 }
 
-func DebugPulsarPartitionTopicMatch(m map[string]bool, partitionTopic string) bool {
-	return m[partitionTopic]
+func DebugPulsarPartitionTopicMatch(s set.Set[string], partitionTopic string) bool {
+	return s.Contains(partitionTopic)
 }
