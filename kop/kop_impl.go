@@ -3,7 +3,6 @@ package kop
 import (
 	"context"
 	"fmt"
-	"github.com/Shoothzj/gox/listx"
 	"github.com/apache/pulsar-client-go/pulsar"
 	"github.com/protocol-laboratory/kafka-codec-go/codec"
 	"github.com/protocol-laboratory/kafka-codec-go/knet"
@@ -461,21 +460,21 @@ func (b *Broker) FetchAction(addr net.Addr, req *codec.FetchReq) ([]*codec.Fetch
 func (b *Broker) FetchPartition(addr net.Addr, kafkaTopic, clientID string, req *codec.FetchPartitionReq, maxBytes int, minBytes int, maxWaitMs int) (*codec.FetchPartitionResp, error) {
 	start := time.Now()
 	b.mutex.RLock()
-	user, exist := b.userInfoManager[addr]
+	user, userExist := b.userInfoManager[addr]
 	b.mutex.RUnlock()
 	records := make([]*codec.Record, 0)
 	recordBatch := codec.RecordBatch{Records: records}
-	if !exist {
-		b.logger.Addr(addr).ClientID(clientID).Topic(kafkaTopic).Error("fetch partition failed when get userinfo by addr.")
+	if !userExist {
+		b.logger.Addr(addr).ClientID(clientID).Topic(kafkaTopic).Error("fetch partition failed when get userinfo by addr")
 		return &codec.FetchPartitionResp{
 			PartitionIndex: req.PartitionId,
 			ErrorCode:      codec.UNKNOWN_SERVER_ERROR,
 			RecordBatch:    &recordBatch,
 		}, nil
 	}
-	partitionedTopic, err := b.partitionedTopic(user, kafkaTopic, req.PartitionId)
+	_, partitionedTopic, err := b.pulsarTopic(user, kafkaTopic, req.PartitionId)
 	if err != nil {
-		b.logger.Addr(addr).ClientID(clientID).Topic(kafkaTopic).Error("fetch partition failed when get topic.")
+		b.logger.Addr(addr).ClientID(clientID).Topic(kafkaTopic).Error("fetch partition failed when get topic")
 		return &codec.FetchPartitionResp{
 			PartitionIndex: req.PartitionId,
 			ErrorCode:      codec.UNKNOWN_SERVER_ERROR,
@@ -483,30 +482,75 @@ func (b *Broker) FetchPartition(addr net.Addr, kafkaTopic, clientID string, req 
 		}, nil
 	}
 	b.mutex.RLock()
-	consumerHandle, exist := b.consumerManager[partitionedTopic+clientID]
-	if !exist {
-		groupId, exist := b.topicGroupManager[partitionedTopic+clientID]
-		b.mutex.RUnlock()
-		if exist {
-			group, err := b.groupCoordinator.GetGroup(user.username, groupId)
-			if err == nil && group.groupStatus != Stable {
-				b.logger.Addr(addr).ClientID(clientID).Topic(kafkaTopic).Infof(
-					"group is preparing rebalance. partitionedTopic: %s", partitionedTopic)
-				return &codec.FetchPartitionResp{
-					LastStableOffset: 0,
-					ErrorCode:        codec.NONE,
-					LogStartOffset:   0,
-					RecordBatch:      &recordBatch,
-					PartitionIndex:   req.PartitionId,
-				}, nil
-			}
-		}
-		b.groupCoordinator.DelGroup(user.username, groupId)
-		b.logger.Addr(addr).ClientID(clientID).Topic(kafkaTopic).Errorf(
-			"can not find consumer for topic when fetch partition %s", partitionedTopic)
-		return nil, fmt.Errorf("can not find consumer for topic: %s", partitionedTopic)
-	}
+	_, memberExist := b.memberManager[addr]
+	consumerHandle, consumerExist := b.consumerManager[partitionedTopic+clientID]
 	b.mutex.RUnlock()
+	if !memberExist {
+		b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Infof("new fetch connection")
+		b.mutex.Lock()
+		if consumerExist {
+			consumerHandle.close()
+			delete(b.consumerManager, partitionedTopic+clientID)
+		}
+		b.mutex.Unlock()
+	}
+
+	b.mutex.Lock()
+	_, consumerExist = b.consumerManager[partitionedTopic+clientID]
+	groupId, groupExist := b.topicGroupManager[partitionedTopic+clientID]
+	if !consumerExist {
+		if !groupExist {
+			b.mutex.Unlock()
+			b.groupCoordinator.DelGroup(user.username, groupId)
+			b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Errorf("can not find consumer for topic when fetch message")
+			return nil, fmt.Errorf("can not find consumer for topic when fetch message")
+		}
+		group, err := b.groupCoordinator.GetGroup(user.username, groupId)
+		if err == nil && group.groupStatus != Stable {
+			b.mutex.Unlock()
+			b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Infof("group is preparing rebalance")
+			return &codec.FetchPartitionResp{
+				PartitionIndex: req.PartitionId,
+				ErrorCode:      codec.NONE,
+				RecordBatch:    &recordBatch,
+			}, nil
+		}
+		err = b.createConsumer(addr, user.username, clientID, kafkaTopic, partitionedTopic, req.PartitionId)
+		if err != nil {
+			b.mutex.Unlock()
+			b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Errorf("fetch action create consumer failed: %v", err)
+			return &codec.FetchPartitionResp{
+				PartitionIndex: req.PartitionId,
+				ErrorCode:      codec.UNKNOWN_SERVER_ERROR,
+				RecordBatch:    &recordBatch,
+			}, nil
+		}
+		b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Infof("offset action create consumer success")
+	}
+	b.mutex.Unlock()
+
+	b.mutex.Lock()
+	consumerHandle, consumerExist = b.consumerManager[partitionedTopic+clientID]
+	b.mutex.Unlock()
+	if !consumerExist {
+		b.groupCoordinator.DelGroup(user.username, groupId)
+		b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Errorf("can not find consumer for topic when fetch message")
+		return nil, fmt.Errorf("can not find consumer for topic when fetch message")
+	}
+
+	if consumerHandle.address != addr.String() {
+		b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Errorf("fetch message but consumer address no match, consumer belong to %s", consumerHandle.address)
+		return &codec.FetchPartitionResp{
+			PartitionIndex: req.PartitionId,
+			ErrorCode:      codec.UNKNOWN_SERVER_ERROR,
+			RecordBatch:    &recordBatch,
+		}, nil
+	}
+
+	b.mutex.Lock()
+	b.setFetchMemberInfo(addr, partitionedTopic, clientID)
+	b.mutex.Unlock()
+
 	byteLength := 0
 	var baseOffset int64
 	fistMessage := true
@@ -519,6 +563,10 @@ OUT:
 		}
 		flowControl := b.server.HasFlowQuota(user.username, partitionedTopic)
 		if !flowControl {
+			break
+		}
+		if consumerHandle.consumer == nil {
+			b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Warn("fetch message but consumer closed")
 			break
 		}
 		consumerHandle.mutex.Lock()
@@ -545,6 +593,9 @@ OUT:
 		consumerHandle.mutex.Unlock()
 		byteLength = byteLength + utils.CalculateMsgLength(message)
 		if fistMessage {
+			if b.config.NetworkDebugEnable {
+				b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Infof("first fetch pulsar offset: %d", offset)
+			}
 			fistMessage = false
 			baseOffset = offset
 		}
@@ -583,11 +634,9 @@ OUT:
 	}
 	recordBatch.Offset = baseOffset
 	return &codec.FetchPartitionResp{
-		ErrorCode:        codec.NONE,
-		PartitionIndex:   req.PartitionId,
-		LastStableOffset: 0,
-		LogStartOffset:   0,
-		RecordBatch:      &recordBatch,
+		ErrorCode:      codec.NONE,
+		PartitionIndex: req.PartitionId,
+		RecordBatch:    &recordBatch,
 	}, nil
 }
 
@@ -656,7 +705,7 @@ func (b *Broker) GroupLeaveAction(addr net.Addr, req *codec.LeaveGroupReq) (*cod
 		consumerHandle, exist := b.consumerManager[topic+req.ClientId]
 		if exist {
 			consumerHandle.mutex.Lock()
-			consumerHandle.consumer.Close()
+			consumerHandle.close()
 			consumerHandle.mutex.Unlock()
 			b.logger.Addr(addr).ClientID(req.ClientId).Infof("success close consumer topic: %s", group.partitionedTopic)
 			if err := b.offsetManager.GracefulSendOffsetMessage(topic, consumerHandle); err != nil {
@@ -697,41 +746,61 @@ func (b *Broker) GroupSyncAction(addr net.Addr, req *codec.SyncGroupReq) (*codec
 	return syncGroupResp, nil
 }
 
-func (b *Broker) OffsetListPartitionAction(addr net.Addr, topic, clientID string, req *codec.ListOffsetsPartition) (*codec.ListOffsetsPartitionResp, error) {
+func (b *Broker) OffsetListPartitionAction(addr net.Addr, kafkaTopic, clientID string, req *codec.ListOffsetsPartition) (*codec.ListOffsetsPartitionResp, error) {
 	b.mutex.RLock()
 	user, exist := b.userInfoManager[addr]
 	b.mutex.RUnlock()
 	if !exist {
-		b.logger.Addr(addr).ClientID(clientID).Topic(topic).Error("offset list failed when get username by addr.")
+		b.logger.Addr(addr).ClientID(clientID).Topic(kafkaTopic).Error("offset list failed when get username by addr")
 		return &codec.ListOffsetsPartitionResp{
 			PartitionId: req.PartitionId,
 			ErrorCode:   codec.UNKNOWN_SERVER_ERROR,
 		}, nil
 	}
-	b.logger.Addr(addr).ClientID(clientID).Topic(topic).Infof("offset list topic, partition: %d", req.PartitionId)
-	partitionedTopic, err := b.partitionedTopic(user, topic, req.PartitionId)
+	b.logger.Addr(addr).ClientID(clientID).Topic(kafkaTopic).Infof("offset list kafkaTopic, partition: %d", req.PartitionId)
+	partitionedTopic, err := b.partitionedTopic(user, kafkaTopic, req.PartitionId)
 	if err != nil {
-		b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Errorf("get topic failed. err: %s", err)
+		b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Errorf("get kafkaTopic failed: %s", err)
 		return &codec.ListOffsetsPartitionResp{
 			PartitionId: req.PartitionId,
 			ErrorCode:   codec.UNKNOWN_SERVER_ERROR,
 		}, nil
 	}
+
+	b.mutex.Lock()
+	b.setFetchMemberInfo(addr, partitionedTopic, clientID)
+	_, consumerExist := b.consumerManager[partitionedTopic+clientID]
+	if !consumerExist {
+		b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Error("offset list failed, consumer not exist, start rebuild consumer")
+		err := b.createConsumer(addr, user.username, clientID, kafkaTopic, partitionedTopic, req.PartitionId)
+		if err != nil {
+			b.mutex.Unlock()
+			b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Errorf("offset list failed, create consumer failed: %v", err)
+			return &codec.ListOffsetsPartitionResp{
+				PartitionId: req.PartitionId,
+				ErrorCode:   codec.UNKNOWN_SERVER_ERROR,
+			}, nil
+		}
+		b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Infof("offset list create consumer success")
+	}
+	b.mutex.Unlock()
+
 	b.mutex.RLock()
 	consumerHandle, exist := b.consumerManager[partitionedTopic+clientID]
 	b.mutex.RUnlock()
 	if !exist {
-		b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Error("offset list failed, topic does not exist.")
+		b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Errorf("offset list failed, consumer not exist")
 		return &codec.ListOffsetsPartitionResp{
 			PartitionId: req.PartitionId,
 			ErrorCode:   codec.UNKNOWN_SERVER_ERROR,
 		}, nil
 	}
+
 	offset := constant.DefaultOffset
 	if req.Time == constant.TimeLasted {
 		latestMsgId, err := utils.GetLatestMsgId(partitionedTopic, b.pAdmin)
 		if err != nil {
-			b.logger.Addr(addr).ClientID(clientID).Topic(topic).Errorf("get topic latest offset failed %s", err)
+			b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Errorf("get kafkaTopic latest offset failed %s", err)
 			return &codec.ListOffsetsPartitionResp{
 				PartitionId: req.PartitionId,
 				ErrorCode:   codec.UNKNOWN_SERVER_ERROR,
@@ -739,7 +808,7 @@ func (b *Broker) OffsetListPartitionAction(addr net.Addr, topic, clientID string
 		}
 		lastedMsg, err := utils.ReadLatestMsg(partitionedTopic, b.config.MaxFetchWaitMs, latestMsgId, consumerHandle.client)
 		if err != nil {
-			b.logger.Addr(addr).ClientID(clientID).Topic(topic).Errorf("read lasted latestMsgId failed. err: %s", err)
+			b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Errorf("read lasted latestMsgId failed. err: %s", err)
 			return &codec.ListOffsetsPartitionResp{
 				PartitionId: req.PartitionId,
 				ErrorCode:   codec.UNKNOWN_SERVER_ERROR,
@@ -758,10 +827,10 @@ func (b *Broker) OffsetListPartitionAction(addr net.Addr, topic, clientID string
 			}
 			if lastedMsg.Index() == nil {
 				b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Infof(
-					"kafka topic previous message id: %s, when trigger offset list partition action", lastedMsg.ID())
+					"kafka kafkaTopic previous message id: %s, when trigger offset list partition action", lastedMsg.ID())
 			} else {
 				b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Infof(
-					"kafka topic previous message id: %s offset: %d, when trigger offset list partition action", lastedMsg.ID(), *lastedMsg.Index())
+					"kafka kafkaTopic previous message id: %s offset: %d, when trigger offset list partition action", lastedMsg.ID(), *lastedMsg.Index())
 			}
 			offset = convOffset(lastedMsg, b.config.ContinuousOffset) + 1
 		}
@@ -773,20 +842,20 @@ func (b *Broker) OffsetListPartitionAction(addr net.Addr, topic, clientID string
 	}, nil
 }
 
-func (b *Broker) OffsetCommitPartitionAction(addr net.Addr, topic, clientID string, req *codec.OffsetCommitPartitionReq) (*codec.OffsetCommitPartitionResp, error) {
+func (b *Broker) OffsetCommitPartitionAction(addr net.Addr, kafkaTopic, clientID string, req *codec.OffsetCommitPartitionReq) (*codec.OffsetCommitPartitionResp, error) {
 	b.mutex.RLock()
 	user, exist := b.userInfoManager[addr]
 	b.mutex.RUnlock()
 	if !exist {
-		b.logger.Addr(addr).ClientID(clientID).Topic(topic).Error("offset commit failed when get userinfo by addr.")
+		b.logger.Addr(addr).ClientID(clientID).Topic(kafkaTopic).Error("offset commit failed when get userinfo by addr")
 		return &codec.OffsetCommitPartitionResp{
 			PartitionId: req.PartitionId,
 			ErrorCode:   codec.UNKNOWN_SERVER_ERROR,
 		}, nil
 	}
-	partitionedTopic, err := b.partitionedTopic(user, topic, req.PartitionId)
+	partitionedTopic, err := b.partitionedTopic(user, kafkaTopic, req.PartitionId)
 	if err != nil {
-		b.logger.Addr(addr).ClientID(clientID).Topic(topic).Errorf("offset commit failed when get topic, err: %v", err)
+		b.logger.Addr(addr).ClientID(clientID).Topic(kafkaTopic).Errorf("offset commit failed when get kafkaTopic: %v", err)
 		return &codec.OffsetCommitPartitionResp{
 			PartitionId: req.PartitionId,
 			ErrorCode:   codec.UNKNOWN_SERVER_ERROR,
@@ -801,13 +870,16 @@ func (b *Broker) OffsetCommitPartitionAction(addr net.Addr, topic, clientID stri
 			group, err := b.groupCoordinator.GetGroup(user.username, groupId)
 			if err == nil && group.groupStatus != Stable {
 				b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Warn(
-					"group is preparing rebalance.")
+					"group is preparing rebalance")
 				return &codec.OffsetCommitPartitionResp{ErrorCode: codec.REBALANCE_IN_PROGRESS}, nil
 			}
 		}
 		b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Error(
-			"commit offset failed, does not exist.")
-		return &codec.OffsetCommitPartitionResp{ErrorCode: codec.UNKNOWN_TOPIC_ID}, nil
+			"commit offset consumer does not exist.")
+		return &codec.OffsetCommitPartitionResp{
+			PartitionId: req.PartitionId,
+			ErrorCode:   codec.NONE,
+		}, nil
 	}
 	b.mutex.RUnlock()
 	consumerMessages.mutex.RLock()
@@ -823,16 +895,16 @@ func (b *Broker) OffsetCommitPartitionAction(addr net.Addr, topic, clientID stri
 		messageIdPair := front.Value
 		// kafka commit offset maybe greater than current offset
 		if messageIdPair.Offset == req.Offset || ((messageIdPair.Offset < req.Offset) && (i == length-1)) {
-			err := b.offsetManager.CommitOffset(user.username, topic, consumerMessages.groupId, req.PartitionId, messageIdPair)
+			err := b.offsetManager.CommitOffset(user.username, kafkaTopic, consumerMessages.groupId, req.PartitionId, messageIdPair)
 			if err != nil {
-				b.logger.Addr(addr).ClientID(clientID).Topic(topic).Errorf("commit offset failed. err: %s", err)
+				b.logger.Addr(addr).ClientID(clientID).Topic(kafkaTopic).Errorf("commit offset failed: %s", err)
 				return &codec.OffsetCommitPartitionResp{
 					PartitionId: req.PartitionId,
 					ErrorCode:   codec.UNKNOWN_SERVER_ERROR,
 				}, nil
 			}
 			b.logger.Addr(addr).ClientID(clientID).Topic(partitionedTopic).Infof(
-				"ack topic, messageID: %s, offset: %d", messageIdPair.MessageId, messageIdPair.Offset)
+				"ack messageID: %s, offset: %d", messageIdPair.MessageId, messageIdPair.Offset)
 			consumerMessages.mutex.Lock()
 			consumerMessages.messageIds.Remove(front)
 			consumerMessages.mutex.Unlock()
@@ -849,46 +921,6 @@ func (b *Broker) OffsetCommitPartitionAction(addr net.Addr, topic, clientID stri
 		PartitionId: req.PartitionId,
 		ErrorCode:   codec.NONE,
 	}, nil
-}
-
-func (b *Broker) createConsumerHandle(partitionedTopic string, subscriptionName string, messageId pulsar.MessageID, clientId string) (*PulsarConsumerHandle, error) {
-	var (
-		handle = &PulsarConsumerHandle{messageIds: listx.New[MessageIdPair]()}
-		err    error
-	)
-	pulsarUrl := fmt.Sprintf("pulsar://%s:%d", b.config.PulsarConfig.Host, b.config.PulsarConfig.TcpPort)
-	handle.client, err = pulsar.NewClient(pulsar.ClientOptions{URL: pulsarUrl})
-	if err != nil {
-		b.logger.ClientID(clientId).Topic(partitionedTopic).Errorf("create pulsar client failed: %v", err)
-		return nil, err
-	}
-	handle.channel = make(chan pulsar.ConsumerMessage, b.config.ConsumerReceiveQueueSize)
-	options := pulsar.ConsumerOptions{
-		Topic:                       partitionedTopic,
-		Name:                        subscriptionName,
-		SubscriptionName:            subscriptionName,
-		Type:                        pulsar.Failover,
-		SubscriptionInitialPosition: pulsar.SubscriptionPositionEarliest,
-		MessageChannel:              handle.channel,
-		ReceiverQueueSize:           b.config.ConsumerReceiveQueueSize,
-	}
-	handle.consumer, err = handle.client.Subscribe(options)
-	if err != nil {
-		b.logger.ClientID(clientId).Topic(partitionedTopic).Warnf("subscribe consumer failed: %s", err)
-		handle.close()
-		return nil, err
-	}
-	if messageId != pulsar.EarliestMessageID() {
-		err = handle.consumer.Seek(messageId)
-		if err != nil {
-			b.logger.ClientID(clientId).Topic(partitionedTopic).Warnf("seek message failed: %s", err)
-			handle.close()
-			return nil, err
-		}
-		b.logger.ClientID(clientId).Topic(partitionedTopic).Infof("kafka topic previous message id: %s", messageId)
-	}
-	b.logger.ClientID(clientId).Topic(partitionedTopic).Infof("create consumer success, subscription name: %s", subscriptionName)
-	return handle, nil
 }
 
 func (b *Broker) checkPartitionTopicExist(topics []string, partitionTopic string) bool {
@@ -919,26 +951,11 @@ func (b *Broker) OffsetFetchAction(addr net.Addr, topic, clientID, groupID strin
 			ErrorCode: codec.UNKNOWN_SERVER_ERROR,
 		}, nil
 	}
-	subscriptionName, err := b.server.SubscriptionName(groupID)
-	if err != nil {
-		b.logger.Addr(addr).ClientID(clientID).Topic(topic).Errorf(
-			"sync group failed when offset fetch, error: %s", err)
-		return &codec.OffsetFetchPartitionResp{
-			ErrorCode: codec.UNKNOWN_SERVER_ERROR,
-		}, nil
-	}
 	messagePair, flag := b.offsetManager.AcquireOffset(user.username, topic, groupID, req.PartitionId)
-	messageId := pulsar.EarliestMessageID()
 	kafkaOffset := constant.UnknownOffset
 	if flag {
 		kafkaOffset = messagePair.Offset + 1
-		messageId = messagePair.MessageId
 	}
-
-	kafkaKey := b.offsetManager.GenerateKey(user.username, topic, groupID, req.PartitionId)
-	b.logger.Addr(addr).ClientID(clientID).Topic(topic).Infof(
-		"acquire offset, key: %s, partition: %d, offset: %d, message id: %s",
-		kafkaKey, req.PartitionId, kafkaOffset, messageId)
 
 	group, err := b.groupCoordinator.GetGroup(user.username, groupID)
 	if err != nil {
@@ -948,32 +965,14 @@ func (b *Broker) OffsetFetchAction(addr net.Addr, topic, clientID, groupID strin
 		}, nil
 	}
 
-	b.mutex.RLock()
-	_, exist = b.consumerManager[partitionedTopic+clientID]
-	b.mutex.RUnlock()
-	if !exist {
-		b.mutex.Lock()
-		consumerHandle, err := b.createConsumerHandle(partitionedTopic, subscriptionName, messageId, clientID)
-		if err != nil {
-			b.mutex.Unlock()
-			b.logger.Addr(addr).ClientID(clientID).Topic(topic).Errorf("create channel failed: %s", err)
-			return &codec.OffsetFetchPartitionResp{
-				ErrorCode: codec.UNKNOWN_SERVER_ERROR,
-			}, nil
-		}
-		consumerHandle.groupId = groupID
-		consumerHandle.username = user.username
-		b.consumerManager[partitionedTopic+clientID] = consumerHandle
-		b.mutex.Unlock()
-	}
+	b.mutex.Lock()
+	b.topicGroupManager[partitionedTopic+clientID] = group.groupId
 	b.topicAddrManager.Set(pulsarTopic, partitionedTopic, addr)
+	b.mutex.Unlock()
 
 	if !b.checkPartitionTopicExist(group.partitionedTopic, partitionedTopic) {
 		group.partitionedTopic = append(group.partitionedTopic, partitionedTopic)
 	}
-	b.mutex.Lock()
-	b.topicGroupManager[partitionedTopic+clientID] = group.groupId
-	b.mutex.Unlock()
 
 	return &codec.OffsetFetchPartitionResp{
 		PartitionId: req.PartitionId,
@@ -1265,7 +1264,7 @@ func (b *Broker) DisconnectRemoteAddr(addrList []string) {
 }
 
 func (b *Broker) DisconnectAction(addr net.Addr) {
-	b.logger.Addr(addr).Info("lost connection.")
+	b.logger.Addr(addr).Info("lost connection")
 	if addr == nil {
 		return
 	}
@@ -1274,17 +1273,29 @@ func (b *Broker) DisconnectAction(addr net.Addr) {
 	producer, producerExist := b.producerManager[addr]
 	b.mutex.RUnlock()
 	if producerExist {
+		b.logger.Addr(addr).Infof("lost connection: close producer")
 		producer.Close()
 		b.mutex.Lock()
 		delete(b.producerManager, addr)
 		b.mutex.Unlock()
 	}
 	if !exist {
+		b.logger.Addr(addr).Infof("lost connection but member not exist")
 		b.mutex.Lock()
 		delete(b.userInfoManager, addr)
 		b.mutex.Unlock()
 		return
 	}
+
+	if memberInfo.fetchRole {
+		b.logger.Addr(addr).ClientID(memberInfo.clientId).Infof("lost connection: close consumer: %v", memberInfo.getPartitionTopics())
+		b.mutex.Lock()
+		b.removeConsumerFromFetchConnection(addr)
+		delete(b.memberManager, addr)
+		b.mutex.Unlock()
+		return
+	}
+
 	memberList := []*codec.LeaveGroupMember{
 		{
 			MemberId:        memberInfo.memberId,
@@ -1334,5 +1345,57 @@ func (b *Broker) DisconnectConsumer(topic string) {
 	}
 	for _, addr := range addrList {
 		b.DisconnectAction(addr)
+	}
+}
+
+func (b *Broker) setFetchMemberInfo(addr net.Addr, topic, clientID string) {
+	if b.memberManager == nil {
+		b.memberManager = make(map[net.Addr]*MemberInfo)
+	}
+	mm, exist := b.memberManager[addr]
+	if !exist {
+		mm = new(MemberInfo)
+	}
+	mm.clientId = clientID
+	mm.fetchRole = true
+	mm.addPartitionTopics(topic)
+	b.memberManager[addr] = mm
+	if b.config.NetworkDebugEnable {
+		b.logger.Addr(addr).Topic(topic).ClientID(clientID).Info("fetch connection get topics: %v", mm.getPartitionTopics())
+	}
+}
+
+func (b *Broker) removeConsumerFromFetchConnection(addr net.Addr) {
+	if b.memberManager == nil {
+		return
+	}
+	member, exist := b.memberManager[addr]
+	if !exist {
+		return
+	}
+	partitionTopics := member.getPartitionTopics()
+	if len(partitionTopics) == 0 {
+		return
+	}
+	clientID := member.clientId
+	for _, partitionTopic := range partitionTopics {
+		consumerKey := partitionTopic + clientID
+		consumerHandle, exist := b.consumerManager[consumerKey]
+		if !exist {
+			continue
+		}
+		if consumerHandle.address != addr.String() {
+			b.logger.Addr(addr).Topic(partitionTopic).ClientID(clientID).Warnf("close consumer but latest connection address is %s", consumerHandle.address)
+			continue
+		}
+		b.logger.Addr(addr).Topic(partitionTopic).ClientID(clientID).Infof("fetch connection start to close consumer")
+		consumerHandle.mutex.Lock()
+		consumerHandle.close()
+		consumerHandle.mutex.Unlock()
+		b.logger.Addr(addr).Topic(partitionTopic).ClientID(clientID).Infof("fetch connection close consumer success")
+		if err := b.offsetManager.GracefulSendOffsetMessage(partitionTopic, consumerHandle); err != nil {
+			b.logger.Addr(addr).ClientID(clientID).Topic(partitionTopic).Errorf("graceful send offset message failed: %v", err)
+		}
+		delete(b.consumerManager, consumerKey)
 	}
 }
